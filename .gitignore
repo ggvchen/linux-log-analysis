@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# 取证产物（真实日志不入库）
+*.tgz
+*.tar.gz
+evidence/
+ir_task/
+var/log/
+var/www/
+report/
+*_report.html
