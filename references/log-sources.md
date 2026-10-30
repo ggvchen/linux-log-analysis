@@ -84,7 +84,7 @@ Dec 14 02:03:52 ubuntu18 su[23612]: Successful su for lee by www-data
 
 ## 五、wtmp / btmp / lastlog 解析
 
-二进制格式，用系统工具：
+### 在线环境：用系统工具
 
 ```bash
 last -Fai | head -50          # 登录历史（-F 完整时间 -a 显示 IP -i IP 数字）
@@ -96,14 +96,93 @@ utmpdump /var/log/wtmp 2>/dev/null | tail -50   # 原始记录，含 reboot/shut
 
 `utmpdump` 的输出能精确看到 `reboot`、`runlevel` 记录，用于**确定环境重置次数与时间点**，这是识别"日志跨多个环境"的关键。
 
-## 六、时间与时区
+### 离线分析：`last -f` 不能跨平台
+
+把证据包拷到 macOS 上跑 `last -f wtmp` 往往只打印一句 `begins ...`，一条记录都没有——utmpx 结构与字节序都不同。要么在 Linux 上分析，要么用 `log_triage.py` 的 struct 解析。
+
+utmp 记录是 **384 字节定长**（Linux x86_64 / glibc，小端）：
+
+| 偏移 | 字段 | 说明 |
+|---|---|---|
+| 0 | `ut_type` | 记录类型，见下表 |
+| 4 | `ut_pid` | 进程号 |
+| 8 | `ut_line[32]` | 终端（`pts/0`、`tty1`、`ssh:notty`） |
+| 44 | `ut_user[32]` | 用户名 |
+| 76 | `ut_host[256]` | 来源主机 / IP |
+| 340 | `ut_tv` | epoch 秒（**绝对时间，比 syslog 可信**） |
+
+`ut_type` 取值：
+
+| 值 | 名称 | 出现在哪 |
+|---|---|---|
+| 1 | RUN_LVL | wtmp，运行级别切换 |
+| 2 | BOOT_TIME | wtmp，**每次重启一条** |
+| 6 | LOGIN_PROCESS | **btmp 的失败登录就是 6**；wtmp 里是 getty 登录提示符 |
+| 7 | USER_PROCESS | wtmp，真实登录会话 |
+| 8 | DEAD_PROCESS | wtmp，会话结束 |
+
+**两个高频坑：**
+
+- btmp 里按 `type=7` 过滤会一条都读不到（失败登录写的是 6），容易误判成"没有暴力破解"。
+- wtmp 里 `type=6` 不是登录，是 getty 提示符；算进"登录历史"会凭空多出会话。
+
+### 用 wtmp/btmp 反查 syslog 的年份
+
+syslog 没有年份，`--year` 只能猜。而 wtmp/btmp 存的是 epoch 绝对时间——把两边的「月-日-时-分」对齐比较，就能验证猜得对不对：
+
+```bash
+# auth.log 里 Oct 8 04:33 的失败登录，对应 btmp 里是哪一年？
+python3 log_triage.py ./var/log --year 2022    # 报告头会直接告警年份可能补错
+```
+
+## 六、auditd：命令级证据
+
+`/var/log/audit/audit.log`（RHEL/CentOS 默认开启；Ubuntu 需装 auditd）。价值在于**记录 execve 的命令与参数**——即使 `.bash_history` 被清空、syslog 被删，这里往往还在。
+
+行格式：
+
+```
+type=USER_CMD msg=audit(1670976100.000:460): pid=1234 uid=0 auid=1000 ses=1 msg='cwd="/root" cmd=6964202D75 exe="/usr/bin/sudo" res=success'
+└─ 记录类型 ─┘ └──── epoch:事件ID ────┘ └──────────────── 字段 ────────────────┘
+```
+
+| type | 含义 | 关键字段 |
+|---|---|---|
+| `USER_LOGIN` | 用户登录 | `acct=` 用户、`addr=` 来源 IP、`res=success/failed` |
+| `USER_AUTH` | 认证尝试 | 同上 |
+| `USER_CMD` | sudo 执行的命令 | `cmd=`（**hex 编码**）、`exe=`、`auid=` |
+| `EXECVE` | 进程执行 | `argc=`、`a0= a1= a2=`（**命令与参数**） |
+| `SYSCALL` | 系统调用 | `syscall=59` 即 execve，与 EXECVE 同事件 ID |
+| `AVC` | SELinux 拒绝 | 提权 / 横向受阻的痕迹 |
+
+**`cmd=` 是十六进制**，必须解码：
+
+```bash
+echo 6964202D75 | xxd -r -p        # -> id -u
+
+# 批量解码最近的 sudo 命令
+grep USER_CMD /var/log/audit/audit.log | grep -o 'cmd=[0-9a-f]*' | cut -d= -f2 \
+  | while read h; do echo "$h" | xxd -r -p; echo; done
+```
+
+`ausearch` 比翻文件快：
+
+```bash
+ausearch -k privesc -i                  # 按 key（需事先配 audit 规则）
+ausearch -m USER_CMD -ts today -i       # 按类型 + 时间
+ausearch -ua 1000 -i | head -50         # 按登录用户
+```
+
+注意 `auid` 与 `uid` 的区别：`auid=1000 uid=0` 表示 **lee 通过 sudo 以 root 执行**，这是判定提权路径的直接依据；只记 `uid=0` 会看不出是谁提的权。
+
+## 七、时间与时区
 
 - syslog 系（auth/syslog/cron）时间戳**不含年份**，跨年日志会误判，必要时用 `--year` 指定。
 - access.log 含时区偏移（`+0000`），`log_triage.py` 会归一到 UTC。
 - 报告必须**标注时区**，并同时给出 UTC 与本地时间（国内 +8）。
 - 检测时钟异常：`journalctl --list-boots`、`last reboot` 与日志时间线是否自洽；若日志某段出现时间倒退，多半是快照恢复或 NTP 纠偏。
 
-## 七、日志被清除的识别
+## 八、日志被清除的识别
 
 攻击者常执行 `rm -rf /var/log/*`、`echo > auth.log`、`history -c`。检查：
 
@@ -117,7 +196,7 @@ cat /var/log/syslog | grep -i "deleted\|truncat"
 
 **日志缺口分析**：正常系统每分钟都有 cron/系统心跳。若某时间段完全无记录，说明日志被截断。
 
-## 八、快速收集清单（上机或远程执行）
+## 九、快速收集清单（上机或远程执行）
 
 ```bash
 # 一次性打包（排除凭据类文件，避免合规问题）
