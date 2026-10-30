@@ -70,15 +70,37 @@ cd /tmp/ir_task && tar xzf ev.tgz
 
 **不要打包** `/etc/shadow`、`~/.bash_history`、数据库配置文件等凭据类文件——既涉合规，也常被安全策略直接拦截。若 crontab 原文读不到，用 `cron.log` 中的 `CMD (...)` 字段还原命令行（多数情况下足够）。
 
+两个容易漏的点：
+
+- **`wtmp` / `btmp` / `audit.log` 一定要带**。它们看起来"打不开"（前两个是二进制），但恰恰是最难被攻击者清理的证据：`syslog` 删了 wtmp 还在，`~/.bash_history` 清了 audit 还在。少了它们的取证包，登录时间与提权命令只能靠猜。
+- **`journal/` 目录跳过**。systemd journal 是分片二进制，体积大且需专用工具，用 `journalctl -D <目录> --since ...` 另行查询更快。
+
 ### 阶段 2：快速分诊
 
 ```bash
 python3 scripts/log_triage.py <日志目录> --year <事件年份> --tz 8
+python3 scripts/log_triage.py <日志目录> --year 2022 \
+        --since "2022-12-14 01:50" --until "2022-12-14 02:10"   # 只看攻击窗口
 ```
 
-脚本自动完成：识别日志类型（含 `.1`、`.2.gz` 轮转与 gzip）、跨文件去重（auth.log 与 syslog 会重复记录）、按 IP 统计 Web 来源、爆破检测、su/sudo/pkexec 提权指纹、crontab 变更与后门聚合、WebShell 候选路径、数据库连接与高危 SQL、统一时间线。
+脚本自动完成：
 
-`--year` 用于补齐 syslog 缺失的年份；`--tz 8` 输出北京时间（默认 UTC）。
+| 日志源 | 提取内容 |
+|---|---|
+| Web access | combined / common / HTTP2 / IPv6；按 IP 统计请求数、首末时间、状态码、UA；爆破检测；WebShell 候选路径（200 与 404 分离判定） |
+| error.log | Apache 原生格式、nginx error、PHP-FPM 三个来源；`eval()'d code` 等强指纹与木马文件名命中的**执行痕迹** |
+| auth / secure / syslog | `Accepted`、`Failed`、su（含执行者 uid）、sudo（含 `rhost=` 失败）、建号、改口令、pkexec 提权指纹 |
+| auditd | `USER_LOGIN` / `USER_AUTH`（登录）、`USER_CMD`（sudo 命令，hex 解码）、`EXECVE`（还原命令行）、`AVC`（SELinux 拒绝） |
+| wtmp / btmp | 登录会话、重启次数（判断快照恢复）、失败登录来源统计 |
+| MySQL | general log 的连接/查询 + error log 的拒绝记录，按 tid 与消息双重去重 |
+| 计划任务 | crontab `REPLACE`/`LIST`、`CRON CMD`、audit 中的执行记录，命中后门特征后按命令聚合 |
+
+参数：
+
+- `--year` 补齐 syslog 缺失的年份（wtmp/btmp 是绝对时间，脚本会用它反查年份是否补错并告警）
+- `--tz 8` 输出北京时间（默认 UTC）
+- `--since` / `--until` 收窄时间窗，大日志先切窗口能省掉大量噪音
+- 末尾【9】IOC 清单可直接用于封禁与全盘排查
 
 分诊结果只是线索，**必须回到原始日志逐条核对**再下结论。
 
@@ -98,13 +120,21 @@ python3 scripts/log_triage.py <日志目录> --year <事件年份> --tz 8
 
 ### 阶段 4：交叉印证
 
-动手写结论前，对照 `references/attack-patterns.md` 的「判据陷阱」逐条自检。最容易踩的五个：
+动手写结论前，对照 `references/attack-patterns.md` 的「判据陷阱」逐条自检。最容易踩的八个：
 
 - **302 ≠ 登录成功**：失败也跳转。必须以"登录后页面返回 200"判定。
 - **mtime 可伪造**：`touch -t` 能改 Modify，但 ctime 改不了。木马落地时间一律用 `stat` 的 **Change** 字段。
 - **运维 ≠ 攻击者**：管理员也会大量访问后台、SSH 登 root。区分靠"有无爆破、有无上传可执行文件、有无提权/建号/改 cron"。
 - **用户级 crontab 多写 user 字段会失效**：`* * * * * root echo ...` 会让 `sh` 把 `root` 当命令名，报错但不回连。日志中 `(root) CMD (root echo ...)` 的 CMD 内含 `root` 即为证据。
-- **环境可能被重置多次**：MySQL 多个 `started with:` 头、auth.log 多次 `chpasswd ... password changed for root` = 快照恢复过。必须锚定真正的攻击窗口。
+- **环境可能被重置多次**：多个 MySQL `started with:`、反复 `password changed for root`、wtmp 里密集的 boot 记录 = 快照恢复过。必须锚定真正的攻击窗口。
+- **syslog 没有年份，跨年就会补错**：同一份 auth.log 里可能同时存在 2021-10 和 2022-12 的事件，用一个 `--year` 必然错一半。用 **wtmp/btmp 的绝对时间反查**：若两边"月-日-时-分"完全重合而年份不同，就是补错了（脚本会直接告警）。
+- **btmp 的失败登录是 `type=6`（LOGIN_PROCESS）不是 7**：按 7 过滤会一条都读不到，误判成"没有暴力破解"。
+- **MySQL 拒绝登录会被写两遍**：general log 一份（带连接号）、error log 一份（不带），不去重会把三次试探显示成六次。
+
+另外两条取证纪律：
+
+- **取证本身会留痕**：你 SSH 登上去的那一刻，wtmp/auth.log 就多了自己的记录。分析时要把自己的登录排除，并在报告的"取证局限"里写明。
+- **`last -f wtmp` 在 macOS 上读不了 Linux 的 wtmp**（字节序与结构不同，往往只打印文件起始时间）。离线分析必须用脚本解析。
 
 ### 阶段 5：输出报告
 
@@ -124,11 +154,16 @@ stat /path/to/suspect
 # 当前外连（验证后门是否活着）
 ss -antp
 
-# 登录历史
+# 登录历史（在线用 last；离线分析 Linux wtmp 必须用脚本，macOS 的 last -f 读不了）
 last -Fai | head -40; lastb -Fai | head -40; lastlog
 
 # 重启次数（判断环境重置）
 utmpdump /var/log/wtmp 2>/dev/null | grep -i reboot
+
+# auditd：按 key / 按类型检索（比翻日志快得多）
+ausearch -k privesc -i
+ausearch -m USER_LOGIN,USER_CMD -ts today -i
+grep USER_CMD /var/log/audit/audit.log | tail -20   # cmd= 是 hex，需解码
 
 # SUID 基线比对
 find / -xdev -perm -4000 -type f 2>/dev/null
@@ -142,9 +177,9 @@ awk -F: '($2==""){print $1}' /etc/shadow 2>/dev/null
 
 | 文件 | 用途 |
 |---|---|
-| `scripts/log_triage.py` | 日志快速分诊器，一次输出 9 类线索 + 统一时间线 |
-| `references/log-sources.md` | 日志文件清单、字段含义、轮转、时区、日志被清除的识别 |
-| `references/attack-patterns.md` | 各攻击阶段的手法指纹 + **9 个判据陷阱** + 七要素模板 |
+| `scripts/log_triage.py` | 日志快速分诊器，10 节输出（9 类线索 + 统一时间线 + IOC 清单） |
+| `references/log-sources.md` | 日志文件清单、字段含义、轮转、时区、二进制 utmp 结构、日志被清除的识别 |
+| `references/attack-patterns.md` | 各攻击阶段的手法指纹 + **12 个判据陷阱** + 七要素模板 |
 | `assets/report-template.html` | 可打印的应急响应报告模板（浅色主题，A4 友好） |
 
 ## 报告与沟通
